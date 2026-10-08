@@ -1,0 +1,354 @@
+package com.sanedge.transaction.service.impl;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.function.Supplier;
+
+import org.bson.types.ObjectId;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import com.sanedge.common.config.RedisService;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.enums.PaymentStatus;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
+import com.sanedge.transaction.domain.requests.CreateTransactionRequest;
+import com.sanedge.transaction.domain.requests.UpdateTransactionRequest;
+import com.sanedge.transaction.domain.response.TransactionResponse;
+import com.sanedge.transaction.domain.response.TransactionResponseDeleteAt;
+import com.sanedge.transaction.entity.Outbox;
+import com.sanedge.transaction.entity.Transaction;
+import com.sanedge.transaction.repository.OutboxRepository;
+import com.sanedge.transaction.repository.TransactionCommandRepository;
+import com.sanedge.transaction.repository.TransactionQueryRepository;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Uni;
+
+@ExtendWith(MockitoExtension.class)
+class TransactionCommandServiceImplTest {
+
+    private static final String MERCHANT_ID = "507f1f77bcf86cd799439011";
+    private static final String ORDER_ID = "507f1f77bcf86cd799439012";
+    private static final String TX_ID_1 = "507f1f77bcf86cd799439013";
+    private static final String TX_ID_7 = "507f1f77bcf86cd799439017";
+
+    @Mock private TransactionQueryRepository transactionQueryRepo;
+    @Mock private TransactionCommandRepository transactionCommandRepo;
+    @Mock private OutboxRepository outboxRepository;
+    @Mock private RedisService redisService;
+    @Mock private TracingMetrics tracingMetrics;
+
+    @Mock private com.sanedge.common.adapter.merchant.MerchantQueryPort merchantQueryPort;
+    @Mock private com.sanedge.common.adapter.order.OrderQueryPort orderQueryPort;
+    @Mock private com.sanedge.common.adapter.order_item.OrderItemQueryPort orderItemQueryPort;
+
+    private TransactionCommandServiceImpl service;
+
+    @BeforeEach
+    void setUp() {
+        service = new TransactionCommandServiceImpl(transactionQueryRepo, transactionCommandRepo, outboxRepository, redisService, tracingMetrics,
+                merchantQueryPort, orderQueryPort, orderItemQueryPort);
+        service.notificationEmail = "admin@example.com";
+        lenient().when(outboxRepository.persist(any(Outbox.class))).thenReturn(Uni.createFrom().nullItem());
+
+        // Lenient stub for traceAndMeasure
+        lenient().doAnswer(invocation -> {
+            Supplier<Uni<?>> supplier = invocation.getArgument(3);
+            return supplier.get();
+        }).when(tracingMetrics).traceAndMeasure(anyString(), anyString(), any(Attributes.class), any());
+
+        lenient().when(redisService.deleteReactive(anyString())).thenReturn(Uni.createFrom().voidItem());
+        lenient().when(transactionCommandRepo.deleteAllDeleted()).thenReturn(Uni.createFrom().item(true));
+        lenient().when(transactionCommandRepo.restoreAllDeleted()).thenReturn(Uni.createFrom().item(true));
+
+        // common port stubs
+        lenient().when(merchantQueryPort.findByMerchantId(anyString()))
+                .thenReturn(Uni.createFrom().item(new com.sanedge.common.adapter.model.Merchant(
+                        MERCHANT_ID, "Merchant", "api-key", "SUCCESS", "507f1f77bcf86cd79943901a",
+                        Instant.now(), Instant.now())));
+        lenient().when(orderQueryPort.findById(anyString()))
+                .thenReturn(Uni.createFrom().item(new com.sanedge.common.adapter.model.Order(
+                        ORDER_ID, MERCHANT_ID, "507f1f77bcf86cd79943901b", 22200, Instant.now(), Instant.now())));
+        // order items for total calculation: 2*5000 + 1*10000 = 20000 (+11% PPN = 22200)
+        lenient().when(orderItemQueryPort.findOrderItemByOrder(anyString()))
+                .thenReturn(Uni.createFrom().item(List.of(
+                        new com.sanedge.common.adapter.model.OrderItem("507f1f77bcf86cd79943901c", ORDER_ID,
+                                "507f1f77bcf86cd79943901d", 2, 5000, Instant.now(), Instant.now()),
+                        new com.sanedge.common.adapter.model.OrderItem("507f1f77bcf86cd79943901e", ORDER_ID,
+                                "507f1f77bcf86cd79943901f", 1, 10000, Instant.now(), Instant.now()))));
+    }
+
+    private Transaction createMockTransaction(String id) {
+        Transaction tx = new Transaction();
+        tx.setTransactionId(id);
+        tx.setOrderId(ORDER_ID);
+        tx.setMerchantId(new ObjectId(MERCHANT_ID));
+        tx.setPaymentMethod("CREDIT");
+        tx.setAmount(22200); // total 20000 + PPN 11% = 22200
+        tx.setStatus(PaymentStatus.SUCCESS);
+        tx.setCreatedAt(Instant.now());
+        tx.setUpdatedAt(Instant.now());
+        return tx;
+    }
+
+    private CreateTransactionRequest createReq() {
+        CreateTransactionRequest req = new CreateTransactionRequest();
+        req.setMerchantID(MERCHANT_ID);
+        req.setOrderID(ORDER_ID);
+        req.setAmount(22200);
+        req.setPaymentMethod("CREDIT");
+        return req;
+    }
+
+    private UpdateTransactionRequest updateReq() {
+        UpdateTransactionRequest req = new UpdateTransactionRequest();
+        req.setTransactionID(TX_ID_1);
+        req.setMerchantID(MERCHANT_ID);
+        req.setOrderID(ORDER_ID);
+        req.setAmount(22200);
+        req.setPaymentMethod("DEBIT");
+        return req;
+    }
+
+    // ---------- create ----------
+    @Nested
+    @DisplayName("create tests")
+    class CreateTests {
+        @Test void success() {
+            CreateTransactionRequest req = createReq();
+            Transaction saved = createMockTransaction(TX_ID_1);
+            when(transactionCommandRepo.persist(any(Transaction.class))).thenReturn(Uni.createFrom().item(saved));
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getAmount()).isEqualTo(22200);
+        }
+
+        @Test void insufficientAmount_returnsError() {
+            CreateTransactionRequest req = createReq();
+            req.setAmount(10000); // less than total 22000
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient payment amount");
+        }
+
+        @Test void nullFields_returnsError() {
+            CreateTransactionRequest req = new CreateTransactionRequest();
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("All fields are required");
+        }
+
+        @Test void success_persistsOutboxEventInSameTx() {
+            CreateTransactionRequest req = createReq();
+            Transaction saved = createMockTransaction(TX_ID_1);
+            when(transactionCommandRepo.persist(any(Transaction.class))).thenReturn(Uni.createFrom().item(saved));
+
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+
+            ArgumentCaptor<Outbox> outboxCaptor = ArgumentCaptor.forClass(Outbox.class);
+            verify(outboxRepository).persist(outboxCaptor.capture());
+            Outbox captured = outboxCaptor.getValue();
+            assertThat(captured.getTopic()).isEqualTo("email-service-topic-transaction-create");
+            assertThat(captured.getAggregateType()).isEqualTo("TRANSACTION");
+            assertThat(captured.getAggregateId()).isEqualTo(TX_ID_1);
+            assertThat(captured.getPayload()).contains("\"email\"");
+        }
+
+        @Test void replayWithSameIdempotencyKey_returnsExistingWithoutInsert() {
+            CreateTransactionRequest req = createReq();
+            req.setIdempotencyKey("idem-abc-1");
+            Transaction existing = createMockTransaction(TX_ID_7);
+            when(transactionQueryRepo.findByIdempotencyKey("idem-abc-1"))
+                    .thenReturn(Uni.createFrom().item(existing));
+
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.message()).contains("idempotent replay");
+            assertThat(resp.data().getId()).isEqualTo(TX_ID_7);
+            verify(transactionCommandRepo, never()).persist(any(Transaction.class));
+            verify(outboxRepository, never()).persist(any(Outbox.class));
+            verify(merchantQueryPort, never()).findByMerchantId(anyString());
+        }
+
+        @Test void create_persistsIdempotencyKey() {
+            CreateTransactionRequest req = createReq();
+            req.setIdempotencyKey("idem-abc-2");
+            Transaction saved = createMockTransaction(TX_ID_1);
+            lenient().when(transactionQueryRepo.findByIdempotencyKey(anyString()))
+                    .thenReturn(Uni.createFrom().nullItem());
+            when(transactionCommandRepo.persist(any(Transaction.class)))
+                    .thenReturn(Uni.createFrom().item(saved));
+
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+
+            ArgumentCaptor<Transaction> txCaptor = ArgumentCaptor.forClass(Transaction.class);
+            verify(transactionCommandRepo).persist(txCaptor.capture());
+            assertThat(txCaptor.getValue().getIdempotencyKey()).isEqualTo("idem-abc-2");
+        }
+
+        @Test void invalidItemQuantity_doesNotPersistOutbox() {
+            CreateTransactionRequest req = createReq();
+            when(orderItemQueryPort.findOrderItemByOrder(anyString()))
+                    .thenReturn(Uni.createFrom().item(List.of(
+                            new com.sanedge.common.adapter.model.OrderItem("507f1f77bcf86cd79943901c", ORDER_ID,
+                                    "507f1f77bcf86cd79943901d", 0, 5000, Instant.now(), Instant.now()))));
+
+            ApiResponse<TransactionResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            verify(outboxRepository, never()).persist(any(Outbox.class));
+        }
+    }
+
+    // ---------- update ----------
+    @Nested
+    @DisplayName("update tests")
+    class UpdateTests {
+        @Test void success() {
+            UpdateTransactionRequest req = updateReq();
+            Transaction existing = createMockTransaction(TX_ID_1);
+            existing.setStatus(PaymentStatus.PENDING);
+            Transaction saved = createMockTransaction(TX_ID_1);
+            saved.setStatus(PaymentStatus.PENDING);
+            saved.setPaymentMethod("DEBIT");
+            when(transactionQueryRepo.findByTransactionId(anyString())).thenReturn(Uni.createFrom().item(existing));
+            when(transactionCommandRepo.persist(any(Transaction.class))).thenReturn(Uni.createFrom().item(saved));
+
+            ApiResponse<TransactionResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test void transactionNotFound_returnsError() {
+            UpdateTransactionRequest req = updateReq();
+            when(transactionQueryRepo.findByTransactionId(anyString())).thenReturn(Uni.createFrom().nullItem());
+
+            ApiResponse<TransactionResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Transaction not found");
+        }
+
+        @Test void insufficientAmount_returnsError() {
+            UpdateTransactionRequest req = updateReq();
+            req.setAmount(5000);
+            Transaction tx = createMockTransaction(TX_ID_1);
+            tx.setStatus(PaymentStatus.PENDING);
+            when(transactionQueryRepo.findByTransactionId(anyString())).thenReturn(Uni.createFrom().item(tx));
+            ApiResponse<TransactionResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient payment amount");
+        }
+    }
+
+    // ---------- trash ----------
+    @Nested
+    @DisplayName("trash tests")
+    class TrashTests {
+        @Test void success() {
+            String id = TX_ID_1;
+            when(transactionCommandRepo.trashed(anyString())).thenReturn(Uni.createFrom().item(createMockTransaction(TX_ID_1)));
+            ApiResponse<TransactionResponseDeleteAt> resp = service.trash(id).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test void notFound_returnsError() {
+            when(transactionCommandRepo.trashed(anyString())).thenReturn(Uni.createFrom().nullItem());
+            ApiResponse<TransactionResponseDeleteAt> resp = service.trash(TX_ID_1).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Transaction not found");
+        }
+    }
+
+    // ---------- restore ----------
+    @Nested
+    @DisplayName("restore tests")
+    class RestoreTests {
+        @Test void success() {
+            String id = TX_ID_1;
+            when(transactionCommandRepo.restore(anyString())).thenReturn(Uni.createFrom().item(createMockTransaction(TX_ID_1)));
+            ApiResponse<TransactionResponseDeleteAt> resp = service.restore(id).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test void notFound_returnsError() {
+            when(transactionCommandRepo.restore(anyString())).thenReturn(Uni.createFrom().nullItem());
+            ApiResponse<TransactionResponseDeleteAt> resp = service.restore(TX_ID_1).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Transaction not found");
+        }
+    }
+
+    // ---------- delete ----------
+    @Nested
+    @DisplayName("delete tests")
+    class DeleteTests {
+        @Test void success() {
+            String id = TX_ID_1;
+            when(transactionCommandRepo.deletePermanent(anyString())).thenReturn(Uni.createFrom().item(createMockTransaction(TX_ID_1)));
+            ApiResponse<Boolean> resp = service.delete(id).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data()).isTrue();
+        }
+
+        @Test void notFound_returnsError() {
+            when(transactionCommandRepo.deletePermanent(anyString())).thenReturn(Uni.createFrom().nullItem());
+            ApiResponse<Boolean> resp = service.delete(TX_ID_1).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Transaction not found");
+        }
+    }
+
+    // ---------- restoreAll ----------
+    @Nested
+    @DisplayName("restoreAll tests")
+    class RestoreAllTests {
+        @Test void success() {
+            ApiResponse<Boolean> resp = service.restoreAll().await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data()).isTrue();
+        }
+
+        @Test void noTrashed_throwsException() {
+            when(transactionCommandRepo.restoreAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.restoreAll().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("No transactions found in trash");
+        }
+    }
+
+    // ---------- deleteAll ----------
+    @Nested
+    @DisplayName("deleteAll tests")
+    class DeleteAllTests {
+        @Test void success() {
+            ApiResponse<Boolean> resp = service.deleteAll().await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data()).isTrue();
+        }
+
+        @Test void noTrashed_throwsException() {
+            when(transactionCommandRepo.deleteAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.deleteAll().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class)
+                    .hasMessageContaining("No transactions found in trash");
+        }
+    }
+}

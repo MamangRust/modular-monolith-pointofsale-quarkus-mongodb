@@ -1,0 +1,444 @@
+package com.sanedge.order.service.impl;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+
+import org.bson.types.ObjectId;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.sanedge.common.adapter.cashier.CashierQueryPort;
+import com.sanedge.common.adapter.merchant.MerchantQueryPort;
+import com.sanedge.common.adapter.model.CreateOrderItemCmd;
+import com.sanedge.common.adapter.model.UpdateOrderItemCmd;
+import com.sanedge.common.adapter.model.UpdateProductCmd;
+import com.sanedge.common.adapter.order_item.OrderItemCommandPort;
+import com.sanedge.common.adapter.product.ProductCommandPort;
+import com.sanedge.common.adapter.product.ProductQueryPort;
+import com.sanedge.common.config.RedisService;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
+import com.sanedge.order.domain.requests.CreateOrderRequest;
+import com.sanedge.order.domain.requests.UpdateOrderRequest;
+import com.sanedge.order.domain.response.OrderResponse;
+import com.sanedge.order.domain.response.OrderResponseDeleteAt;
+import com.sanedge.order.entity.Order;
+import com.sanedge.order.repository.OrderCommandRepository;
+import com.sanedge.order.repository.OrderQueryRepository;
+import com.sanedge.order.service.OrderCommandService;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Validator;
+
+@ApplicationScoped
+public class OrderCommandServiceImpl implements OrderCommandService {
+    private static final Logger logger = LoggerFactory.getLogger(OrderCommandServiceImpl.class);
+
+    private final OrderQueryRepository orderQueryRepository;
+    private final OrderCommandRepository orderCommandRepository;
+    private final Validator validator;
+    private final RedisService redisService;
+    private final TracingMetrics tracingMetrics;
+    private final MerchantQueryPort merchantQueryPort;
+    private final CashierQueryPort cashierQueryPort;
+    private final ProductQueryPort productQueryPort;
+    private final ProductCommandPort productCommandPort;
+    private final OrderItemCommandPort orderItemCommandPort;
+
+    @Inject
+    public OrderCommandServiceImpl(OrderQueryRepository orderQueryRepository,
+            OrderCommandRepository orderCommandRepository,
+            Validator validator,
+            RedisService redisService,
+            TracingMetrics tracingMetrics,
+            MerchantQueryPort merchantQueryPort,
+            CashierQueryPort cashierQueryPort,
+            ProductQueryPort productQueryPort,
+            ProductCommandPort productCommandPort,
+            OrderItemCommandPort orderItemCommandPort) {
+        this.orderQueryRepository = orderQueryRepository;
+        this.orderCommandRepository = orderCommandRepository;
+        this.validator = validator;
+        this.redisService = redisService;
+        this.tracingMetrics = tracingMetrics;
+        this.merchantQueryPort = merchantQueryPort;
+        this.cashierQueryPort = cashierQueryPort;
+        this.productQueryPort = productQueryPort;
+        this.productCommandPort = productCommandPort;
+        this.orderItemCommandPort = orderItemCommandPort;
+    }
+
+    private <T> void validateRequest(T req) {
+        Set<ConstraintViolation<T>> violations = validator.validate(req);
+        if (!violations.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            for (ConstraintViolation<T> violation : violations) {
+                sb.append(violation.getPropertyPath()).append(": ").append(violation.getMessage()).append("; ");
+            }
+            logger.error("Validation failed: {}", sb);
+            throw new ConstraintViolationException("Validation failed: " + sb, violations);
+        }
+    }
+
+    @Override
+    public Uni<ApiResponse<OrderResponse>> create(CreateOrderRequest request) {
+        logger.info("Creating new order for merchantId={} and cashierId={}", request.getMerchantId(),
+                request.getCashierId());
+        Attributes attrs = Attributes.builder()
+                .put("merchant.id", request.getMerchantId() != null ? request.getMerchantId() : "null")
+                .put("cashier.id", request.getCashierId() != null ? request.getCashierId() : "null")
+                .build();
+
+        return runTraced("createOrder", "create_order", attrs,
+                () -> {
+                    try {
+                        validateRequest(request);
+                    } catch (Exception e) {
+                        return Uni.createFrom().item(new ApiResponse<>("error", e.getMessage(), null));
+                    }
+
+                    return merchantQueryPort
+                            .findByMerchantId(request.getMerchantId())
+                            .chain(merchant -> cashierQueryPort.findById(request.getCashierId()))
+                            .chain(cashier -> {
+                                Order order = new Order();
+                                order.setMerchantId(new ObjectId(request.getMerchantId()));
+                                order.setCashierId(new ObjectId(request.getCashierId()));
+                                Instant now = Instant.now();
+                                order.setCreatedAt(now);
+                                order.setUpdatedAt(now);
+                                order.setTotalPrice(0L);
+
+                                return orderCommandRepository.persist(order).map(v -> order);
+                            })
+                            .chain(order -> Multi.createFrom().iterable(request.getItems())
+                                    .onItem()
+                                    .transformToUniAndConcatenate(itemReq -> productQueryPort
+                                            .findById(itemReq.getProductId())
+                                            .chain(product -> {
+                                                if (product.countInStock() < itemReq.getQuantity()) {
+                                                    logger.error("Insufficient stock for product id={}",
+                                                            itemReq.getProductId());
+                                                    throw new IllegalArgumentException(
+                                                            "Insufficient stock for product id="
+                                                                    + itemReq.getProductId());
+                                                }
+
+                                                // Price is optional in the request — fall back to the product's price.
+                                                Integer unitPrice = itemReq.getPrice() != null ? itemReq.getPrice()
+                                                                : product.price();
+
+                                                CreateOrderItemCmd orderItemCmd = new CreateOrderItemCmd(
+                                                        order.getOrderId(),
+                                                        itemReq.getProductId(),
+                                                        itemReq.getQuantity(),
+                                                        unitPrice);
+
+                                                UpdateProductCmd productCmd = new UpdateProductCmd(
+                                                        product.id(),
+                                                        product.merchantId(),
+                                                        product.categoryId(),
+                                                        product.name(),
+                                                        product.description(),
+                                                        product.price(),
+                                                        product.countInStock() - itemReq.getQuantity(),
+                                                        product.brand(),
+                                                        product.weight(),
+                                                        product.imageProduct());
+
+                                                return Uni.combine().all().unis(
+                                                        orderItemCommandPort.createOrderItem(orderItemCmd),
+                                                        productCommandPort.update(productCmd)).asTuple()
+                                                        .map(t -> itemReq.getQuantity().longValue()
+                                                                * unitPrice.longValue());
+                                            }))
+                                    .collect().in(java.util.ArrayList::new, List::add)
+                                    .map(list -> {
+                                        long sum = list.stream().mapToLong(val -> ((Number) val).longValue()).sum();
+                                        order.setTotalPrice(sum);
+                                        return order;
+                                    }))
+                            .chain(order -> orderCommandRepository.persist(order).map(v -> order))
+                            .map(savedOrder -> {
+                                logger.info("Order created successfully with id={}", savedOrder.getOrderId());
+                                return ApiResponse.success("Order created successfully",
+                                        OrderResponse.from(savedOrder));
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("Failed to create order", e);
+                                return new ApiResponse<>("error", "Failed to create your order: " + e.getMessage(),
+                                        null);
+                            });
+                });
+    }
+
+    @Override
+    public Uni<ApiResponse<OrderResponse>> update(UpdateOrderRequest request) {
+        logger.info("Updating order id={}", request.getOrderId());
+        Attributes attrs = Attributes.builder()
+                .put("order.id", request.getOrderId() != null ? request.getOrderId() : "null")
+                .build();
+
+        return runTraced("updateOrder", "update_order", attrs,
+                () -> {
+                    try {
+                        validateRequest(request);
+                    } catch (Exception e) {
+                        return Uni.createFrom().item(new ApiResponse<>("error", e.getMessage(), null));
+                    }
+
+                    String cacheKey = "order:" + request.getOrderId();
+
+                    return orderQueryRepository.findOrderById(request.getOrderId())
+                            .chain(order -> {
+                                if (order == null) {
+                                    logger.error("Order not found with id={}", request.getOrderId());
+                                    throw new ResourceNotFoundException("Order not found");
+                                }
+
+                                return cashierQueryPort.findById(request.getCashierId())
+                                        .chain(cashier -> Uni.createFrom().item(order));
+                            })
+                            .chain(order -> Multi.createFrom().iterable(request.getItems())
+                                    .onItem()
+                                    .transformToUniAndConcatenate(itemReq -> productQueryPort
+                                            .findById(itemReq.getProductId())
+                                            .chain(product -> {
+                                                // Price is optional in the request — fall back to the product's price.
+                                                Integer unitPrice = itemReq.getPrice() != null ? itemReq.getPrice()
+                                                                : product.price();
+
+                                                if (itemReq.getOrderItemId() != null
+                                                        && !itemReq.getOrderItemId().isEmpty()) {
+                                                    UpdateOrderItemCmd itemCmd = new UpdateOrderItemCmd(
+                                                            itemReq.getOrderItemId(),
+                                                            order.getOrderId(),
+                                                            itemReq.getProductId(),
+                                                            itemReq.getQuantity(),
+                                                            unitPrice);
+                                                    return orderItemCommandPort.updateOrderItem(itemCmd)
+                                                            .map(updated -> itemReq.getQuantity().longValue()
+                                                                    * unitPrice.longValue());
+                                                } else {
+                                                    if (product.countInStock() < itemReq.getQuantity()) {
+                                                        logger.error("Insufficient stock for product id={}",
+                                                                itemReq.getProductId());
+                                                        throw new IllegalArgumentException(
+                                                                "Insufficient stock for product id="
+                                                                        + itemReq.getProductId());
+                                                    }
+
+                                                    CreateOrderItemCmd orderItemCmd = new CreateOrderItemCmd(
+                                                            order.getOrderId(),
+                                                            itemReq.getProductId(),
+                                                            itemReq.getQuantity(),
+                                                            unitPrice);
+
+                                                    UpdateProductCmd productCmd = new UpdateProductCmd(
+                                                            product.id(),
+                                                            product.merchantId(),
+                                                            product.categoryId(),
+                                                            product.name(),
+                                                            product.description(),
+                                                            product.price(),
+                                                            product.countInStock() - itemReq.getQuantity(),
+                                                            product.brand(),
+                                                            product.weight(),
+                                                            product.imageProduct());
+
+                                                    return Uni.combine().all().unis(
+                                                            orderItemCommandPort.createOrderItem(orderItemCmd),
+                                                            productCommandPort.update(productCmd)).asTuple()
+                                                            .map(t -> itemReq.getQuantity().longValue()
+                                                                    * unitPrice.longValue());
+                                                }
+                                            }))
+                                    .collect().in(java.util.ArrayList::new, List::add)
+                                    .map(list -> {
+                                        long sum = list.stream().mapToLong(val -> ((Number) val).longValue()).sum();
+                                        order.setTotalPrice(sum);
+                                        order.setUpdatedAt(Instant.now());
+                                        return order;
+                                    }))
+                            .chain(order -> orderCommandRepository.persist(order).map(v -> order))
+                            .chain(savedOrder -> redisService.deleteReactive(cacheKey).map(v -> savedOrder))
+                            .map(savedOrder -> {
+                                logger.info("Order updated successfully with id={}", savedOrder.getOrderId());
+                                return ApiResponse.success("Order updated successfully",
+                                        OrderResponse.from(savedOrder));
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("Failed to update order id={}", request.getOrderId(), e);
+                                return new ApiResponse<>("error", "Failed to update your order: " + e.getMessage(),
+                                        null);
+                            });
+                });
+    }
+
+    @Override
+    public Uni<ApiResponse<OrderResponseDeleteAt>> trash(String id) {
+        logger.info("Trashing order id={}", id);
+        Attributes attrs = Attributes.builder()
+                .put("order.id", id)
+                .build();
+
+        return runTraced("trashOrder", "trash_order", attrs,
+                () -> {
+                    String cacheKey = "order:" + id;
+
+                    return orderCommandRepository.trashed(id)
+                            .chain(order -> {
+                                if (order == null) {
+                                    logger.error("Order not found for trashing id={}", id);
+                                    throw new ResourceNotFoundException("Order not found");
+                                }
+                                return redisService.deleteReactive(cacheKey).map(v -> order);
+                            })
+                            .map(order -> {
+                                logger.info("Order trashed successfully with id={}", id);
+                                return ApiResponse.success("Order trashed successfully",
+                                        OrderResponseDeleteAt.from(order));
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("Failed to trash order id={}", id, e);
+                                return new ApiResponse<>("error", "Failed to trash order: " + e.getMessage(), null);
+                            });
+                });
+    }
+
+    @Override
+    public Uni<ApiResponse<OrderResponseDeleteAt>> restore(String id) {
+        logger.info("Restoring order id={}", id);
+        Attributes attrs = Attributes.builder()
+                .put("order.id", id)
+                .build();
+
+        return runTraced("restoreOrder", "restore_order", attrs,
+                () -> {
+                    String cacheKey = "order:" + id;
+
+                    return orderCommandRepository.restore(id)
+                            .chain(order -> {
+                                if (order == null) {
+                                    logger.error("Order not found for restoration id={}", id);
+                                    throw new ResourceNotFoundException("Order not found or not in trash");
+                                }
+                                return redisService.deleteReactive(cacheKey).map(v -> order);
+                            })
+                            .map(order -> {
+                                logger.info("Order restored successfully with id={}", id);
+                                return ApiResponse.success("Order restored successfully",
+                                        OrderResponseDeleteAt.from(order));
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("Failed to restore order id={}", id, e);
+                                return new ApiResponse<>("error", "Failed to restore order: " + e.getMessage(), null);
+                            });
+                });
+    }
+
+    @Override
+    public Uni<ApiResponse<Boolean>> delete(String id) {
+        logger.info("Permanently deleting order id={}", id);
+        Attributes attrs = Attributes.builder()
+                .put("order.id", id)
+                .build();
+
+        return runTraced("deleteOrderPermanent", "delete_order_permanent", attrs,
+                () -> {
+                    String cacheKey = "order:" + id;
+
+                    return orderCommandRepository.deletePermanent(id)
+                            .chain(order -> {
+                                if (order == null) {
+                                    logger.error("Order not found for permanent deletion id={}", id);
+                                    throw new ResourceNotFoundException("Order not found or not in trash");
+                                }
+                                return redisService.deleteReactive(cacheKey).map(v -> true);
+                            })
+                            .map(deleted -> {
+                                logger.info("Order permanently deleted with id={}", id);
+                                return ApiResponse.success("Order permanently deleted successfully", true);
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("Failed to permanently delete order id={}", id, e);
+                                return new ApiResponse<>("error",
+                                        "Failed to permanently delete order: " + e.getMessage(), false);
+                            });
+                });
+    }
+
+    @Override
+    public Uni<ApiResponse<Boolean>> restoreAll() {
+        logger.info("Restoring ALL trashed orders");
+
+        return runTraced("restoreAllOrders", "restore_all_orders", Attributes.empty(),
+                () -> orderCommandRepository.restoreAllDeleted()
+                        .map(restored -> {
+                            if (!restored) {
+                                throw new ResourceNotFoundException("No orders found in trash");
+                            }
+
+                            logger.info("All orders restored successfully");
+                            return ApiResponse.success("All orders restored successfully", true);
+                        }));
+    }
+
+    @Override
+    public Uni<ApiResponse<Boolean>> deleteAll() {
+        logger.info("Permanently deleting ALL trashed orders");
+
+        return runTraced("deleteAllOrders", "delete_all_orders", Attributes.empty(),
+                () -> orderCommandRepository.deleteAllDeleted()
+                        .map(deleted -> {
+                            if (!deleted) {
+                                throw new ResourceNotFoundException("No orders found in trash");
+                            }
+
+                            logger.info("All orders permanently deleted successfully");
+                            return ApiResponse.success("All orders permanently deleted successfully", true);
+                        }));
+    }
+
+    @Override
+    public Uni<ApiResponse<OrderResponse>> updateOrderTotalPrice(String orderId, Integer totalPrice) {
+        logger.info("Updating order total price for orderId={} to totalPrice={}", orderId, totalPrice);
+        Attributes attrs = Attributes.builder()
+                .put("order.id", orderId != null ? orderId : "null")
+                .build();
+
+        return runTraced("updateOrderTotalPrice", "update_order_total_price", attrs,
+                () -> orderQueryRepository.findOrderById(orderId)
+                        .chain(order -> {
+                            if (order == null) {
+                                logger.error("Order not found with id={}", orderId);
+                                throw new ResourceNotFoundException("Order not found with id=" + orderId);
+                            }
+                            order.setTotalPrice(totalPrice.longValue());
+                            return orderCommandRepository.persist(order);
+                        })
+                        .map(savedOrder -> {
+                            logger.info("Order total price updated successfully for id={}", savedOrder.getOrderId());
+                            return ApiResponse.success("Order total price updated successfully",
+                                    OrderResponse.from(savedOrder));
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("Failed to update order total price", e);
+                            return new ApiResponse<>("error", "Failed to update order total price: " + e.getMessage(),
+                                    null);
+                        }));
+    }
+
+    private <T> Uni<T> runTraced(String operationName, String method, Attributes attributes,
+            java.util.function.Supplier<Uni<T>> supplier) {
+        return tracingMetrics.traceAndMeasure(operationName, method, attributes, supplier);
+    }
+}
